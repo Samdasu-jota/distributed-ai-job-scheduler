@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: "api_gateway"
+    static_configs:
+      - targets: ["api:8000"]
+    metrics_path: "/metrics"
+
+  # Workers self-register; in production use service discovery.
+  # For Docker Compose, scrape by service name + metrics port.
+  - job_name: "workers"
+    static_configs:
+      - targets:
+          - "worker-audio:9100"
+          - "worker-stt:9100"
+          - "worker-nlp:9100"
+          - "worker-llm:9100"
+          - "worker-diagnostics:9100"
+          - "worker-aggregation:9100"
+    metrics_path: "/metrics"

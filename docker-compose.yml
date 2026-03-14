@@ -1,0 +1,244 @@
+version: "3.9"
+
+services:
+  # ── Infrastructure ──────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: scheduler
+      POSTGRES_USER: scheduler
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-scheduler_dev}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scheduler"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ── API Gateway ──────────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      PIPELINE_LLM_BACKEND: ${PIPELINE_LLM_BACKEND:-mock}
+      PIPELINE_STT_BACKEND: ${PIPELINE_STT_BACKEND:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./api:/app/api
+      - ./shared:/app/shared
+      - ./migrations:/app/migrations
+
+  # ── Scheduler ────────────────────────────────────────────────────────────────
+  scheduler:
+    build:
+      context: .
+      dockerfile: scheduler/Dockerfile
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      SCHEDULER_POLL_INTERVAL: ${SCHEDULER_POLL_INTERVAL:-2}
+      HEARTBEAT_TIMEOUT_SECONDS: ${HEARTBEAT_TIMEOUT_SECONDS:-30}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./scheduler:/app/scheduler
+      - ./shared:/app/shared
+
+  # ── Workers ──────────────────────────────────────────────────────────────────
+  worker-audio:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_audio
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: audio
+      PIPELINE_STT_BACKEND: ${PIPELINE_STT_BACKEND:-mock}
+      PIPELINE_LLM_BACKEND: ${PIPELINE_LLM_BACKEND:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+
+  worker-stt:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_stt
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: stt
+      PIPELINE_STT_BACKEND: ${PIPELINE_STT_BACKEND:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+
+  worker-nlp:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_nlp
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: nlp
+      PIPELINE_LLM_BACKEND: ${PIPELINE_LLM_BACKEND:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+    deploy:
+      replicas: 2   # 2 NLP workers compete via consumer group — demonstrates horizontal scaling
+
+  worker-llm:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_llm
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: llm
+      PIPELINE_LLM_BACKEND: ${PIPELINE_LLM_BACKEND:-mock}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+    deploy:
+      replicas: 2
+
+  worker-diagnostics:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_diagnostics
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: diagnostics
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+
+  worker-aggregation:
+    build:
+      context: .
+      dockerfile: workers/Dockerfile
+    command: python -m worker_aggregation
+    environment:
+      DATABASE_URL: postgresql://scheduler:${POSTGRES_PASSWORD:-scheduler_dev}@postgres:5432/scheduler
+      REDIS_URL: redis://redis:6379
+      WORKER_TYPE: aggregation
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./workers:/app
+      - ./shared:/app/shared
+
+  # ── Observability ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:v2.51.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-lifecycle"
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/datasources:/etc/grafana/provisioning/datasources
+      - ./observability/grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+
+  # ── Frontend ─────────────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:3000"
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      NEXT_PUBLIC_WS_URL: ws://localhost:8000
+    depends_on:
+      - api
+
+volumes:
+  postgres_data:
+  redis_data:
+  grafana_data:
+
+networks:
+  default:
+    name: tutor_scheduler_net
